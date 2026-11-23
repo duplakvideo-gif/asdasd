@@ -454,8 +454,8 @@
       // Desktop and mobile overview place destination links and resource icons in different cells.
       const targetCell = cells[mobile ? 3 : 4];
       const targetLink = [...(targetCell?.querySelectorAll('a[href]') || [])]
-        .map(x => x.getAttribute('href') || '').find(h => /[?&]id=\\d+/.test(h));
-      const id = targetLink?.match(/[?&]id=(\\d+)/)?.[1];
+        .map(x => x.getAttribute('href') || '').find(h => /[?&]id=\d+/.test(h));
+      const id = targetLink?.match(/[?&]id=(\d+)/)?.[1];
       if (!id) continue;
       const resourceCell = cells[mobile ? 5 : 8];
       if (!resourceCell) continue;
@@ -477,7 +477,7 @@
         const epoch = timestamp > 1e12 ? timestamp / 1000 : timestamp;
         etaMinutes = Math.max(0, (epoch - Date.now() / 1000) / 60);
       } else if (timer) {
-        const match = timer.textContent.match(/(\\d+):(\\d{2}):(\\d{2})/);
+        const match = timer.textContent.match(/(\d+):(\d{2}):(\d{2})/);
         if (match) etaMinutes = +match[1]*60 + +match[2] + +match[3]/60;
       }
       if (!byId[id]) byId[id] = { transfers:[], unknown:[0,0,0] };
