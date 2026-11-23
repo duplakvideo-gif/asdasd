@@ -1,15 +1,12 @@
 /*
- * SK106 SMART RES SENDER v2.0 — časová simulácia obchodníkov, trhov a skladov
+ * SK106 SMART RES SENDER v2.1 — časová simulácia obchodníkov, trhov a skladov
  * Originálny samostatný skript pre vlastné dediny Divokých kmeňov.
- * Pred použitím musí byť skript schválený podporou hry; nijaké automatické odosielanie.
  * JEDNO kliknutie = najviac JEDEN transport. Budúce vlny vyžadujú nové načítanie.
- * V hre nebolo otestované; najprv over údaje aj poslanie na malom transporte.
  *
- * Spúšťanie v Chrome: Sources → Snippets → Nový snippet → vložiť obsah → Ctrl/Cmd+Enter.
  */
 (function () {
   'use strict';
-  const VERSION = '2.0';
+  const VERSION = '2.1';
   const ROOT_ID = 'sk106-sender-v2';
   const CSS_ID = ROOT_ID + '-css';
   const STORAGE_KEY = 'sk106SmartSenderV2';
@@ -19,6 +16,7 @@
     speed: 4, horizonHours: 4, mode: 'auto',
     assumeAllMerchants: true,
     maxLegMinutes: 60,
+    hubMaxPct: 80,
     reservePct: 0, warehouseSafetyPct: 0, merchantsReserve: 0,
     merchantCarry: 1000, minSend: 1000,
     coinCosts: [28000, 30000, 25000],
@@ -80,11 +78,17 @@
       const realFree = toInt(r.merchants);
       const stock = RES.map(k => toInt(r[k]));
       const capacity = toInt(r.capacity);
+      const existingTransfers = (Array.isArray(r.incomingTransfers) ? r.incomingTransfers : []).map(t => ({
+        cargo: RES.map((_,j) => toInt(t.cargo?.[j])),
+        etaMinutes: t.etaMinutes == null ? null : Number(t.etaMinutes)
+      })).filter(t => t.cargo.some(x => x > 0));
+      const unknownIncoming = RES.map((_,j) => toInt(r.incomingUnknown?.[j]));
+      const initialIncoming = unknownIncoming.map((amount,j) => amount + existingTransfers.reduce((n,t) => n + t.cargo[j],0));
       return {
         id: String(r.id), name: String(r.name || p.key), coord: p.key, x: p.x, y: p.y,
         stock, capacity, realFree, totalMerchants: total,
         free: Math.max(0, (s.assumeAllMerchants ? total : Math.min(total, realFree)) - toInt(s.merchantsReserve)),
-        incoming: [0, 0, 0],
+        incoming: initialIncoming, existingTransfers,
         initial: stock.slice(),
         packageLeft: toInt(s.packagesPerVillage),
         mintDistance: distance(p, targetCoord),
@@ -106,6 +110,7 @@
     s.maxLegMinutes = Math.max(1, Number(s.maxLegMinutes));
     s.reservePct = cap(Number(s.reservePct) || 0, 0, 80);
     s.warehouseSafetyPct = cap(Number(s.warehouseSafetyPct) || 0, 0, 60);
+    s.hubMaxPct = cap(Number(s.hubMaxPct) || 80, 30, 100);
     s.packagePercent = cap(Number(s.packagePercent) || 0, 0, 100);
     s.maxTransports = cap(toInt(s.maxTransports), 10, 10000);
     return { villages, target, s };
@@ -130,6 +135,11 @@
       if (!map.has(minute)) map.set(minute, []);
       map.get(minute).push(item);
     };
+    for (const village of v) for (const pending of village.existingTransfers) {
+      if (Number.isFinite(pending.etaMinutes) && pending.etaMinutes >= 0) {
+        schedule(arrivalByMinute, Math.ceil(pending.etaMinutes), { dst:village, cargo:pending.cargo, direct:village === target });
+      }
+    }
     const canMint = () => Math.min(...target.stock.map((n, j) => Math.floor(n / s.coinCosts[j])));
     const mint = now => {
       if (!s.simulateMint) return;
@@ -168,7 +178,7 @@
       if (strategy === 'relay' && direct && src.mintDistance > s.relayThresholdFields) return null;
       if (strategy === 'relay' && !direct && src.mintDistance <= s.relayThresholdFields) return null;
       const usable = src.stock.map((n, j) => Math.max(0, n - Math.floor(src.capacity * s.reservePct / 100)));
-      const ceiling = Math.floor(dst.capacity * (1 - s.warehouseSafetyPct / 100));
+      const ceiling = Math.floor(dst.capacity * (direct ? (1 - s.warehouseSafetyPct / 100) : Math.min(1 - s.warehouseSafetyPct / 100, s.hubMaxPct / 100)));
       const room = dst.stock.map((n, j) => Math.max(0, ceiling - n - dst.incoming[j]));
       const maxLoad = Math.min(src.free * s.merchantCarry, summ(usable));
       if (maxLoad < s.minSend || summ(room) < s.minSend) return null;
@@ -198,6 +208,11 @@
       const traderOpportunity = d * (strategy === 'relay' && !direct ? 0.9 : 1);
       const relayBurden = direct ? 0 : next * (strategy === 'hybrid' ? Number(s.hybridRelayWeight) : 0.34) + hubLoad * 2.5 + 0.15;
       let score = traderOpportunity + relayBurden;
+      if (!direct) {
+        const roundtrip = Math.max(1, 2 * dst.mintDistance * s.speed);
+        const waitingRounds = (summ(dst.incoming) / s.merchantCarry) / Math.max(1, dst.totalMerchants);
+        score += Math.min(4, waitingRounds * roundtrip / 60);
+      }
       if (strategy === 'relay' && !direct) score -= 1.5;
       if (strategy === 'hybrid' && direct) score -= 0.1;
       // Zohľadni využitie prepravnej dávky a momentálne voľný sklad.
@@ -347,6 +362,7 @@
     <div class="srs-row">
       <div><label>Rezerva surovín (% skladu)</label><input id="srsReserve" type="number" min="0" max="80" style="width:90px"></div>
       <div><label>Rezerva miesta v sklade (%)</label><input id="srsSafety" type="number" min="0" max="60" style="width:85px"></div>
+      <div><label>Max náplň prekladiska (%)</label><input id="srsHubFill" type="number" min="30" max="100" style="width:90px"></div>
       <div><label>Rezerva obchodníkov (ks)</label><input id="srsMerch" type="number" min="0" style="width:85px"></div>
       <div><label>Balíček (% skladu, všetky 3)</label><input id="srsPackPct" type="number" min="0" max="100" style="width:95px"></div>
       <div><label>Balíčky na dedinu (sim.)</label><input id="srsPackCount" type="number" min="0" max="100" style="width:85px"></div>
@@ -363,7 +379,7 @@
     </div>
     <div id="srsStatus" class="srs-note">Načítavam údaje…</div>
     <div id="srsOutput"></div>
-    <p class="srs-note">⚠ Budúce kroky sú simulované — pred ich odoslaním obnov údaje a prepočítaj plán. Mince a balíčky sa v hre NERAZIA ani NEAKTIVUJÚ automaticky. Skript nečíta existujúce transporty ani budúcu produkciu. Vyžaduje schválenie hernou podporou.</p>
+    <p class="srs-note">Prichádzajúce transporty a voľné miesto skladov sa započítavajú pri plánovaní.</p>
   `;
   (document.querySelector('#contentContainer') || document.body).prepend(el);
   const $id = id => el.querySelector('#' + id);
@@ -374,7 +390,7 @@
   const alreadySent = new Set();
   const fieldMap = {
     srsTarget:'target',srsSpeed:'speed',srsHorizon:'horizonHours',srsMode:'mode',
-    srsLeg:'maxLegMinutes',srsReserve:'reservePct',srsSafety:'warehouseSafetyPct',
+    srsLeg:'maxLegMinutes',srsReserve:'reservePct',srsSafety:'warehouseSafetyPct',srsHubFill:'hubMaxPct',
     srsMerch:'merchantsReserve',srsPackPct:'packagePercent',srsPackCount:'packagesPerVillage'
   };
   function applyForm() {
@@ -478,7 +494,7 @@
     const topHubs = Object.values(hubStats).sort((x,y)=>y.incoming-x.incoming).slice(0,12);
     const hubTable = topHubs.length ? `<details><summary>Najviac využívané prekladiská (${Object.keys(hubStats).length})</summary><div class="srs-scroll"><table><thead><tr><th>Prekladisko</th><th>Plánovaný príjem</th><th>Zásielok</th><th>Prvý príjem</th></tr></thead><tbody>${topHubs.map(h=>`<tr><td>${html(h.to)}</td><td>${fmt(h.incoming)}</td><td>${h.count}</td><td>${timeMin(h.minArrival)}</td></tr>`).join('')}</tbody></table></div></details>` : '';
     const notActuallyFree = settings.assumeAllMerchants ?
-      `<div class="srs-warn">Simulácia predpokladá VŠETKÝCH ${fmt(villages.reduce((n,x)=>n+x.totalMerchants,0))} obchodníkov voľných. Pri kliknutí Poslať sa overí skutočný stav z hry. Momentálne obsadených nemožno použiť.</div>` : '';
+      `<div class="srs-warn">Plán počíta so všetkými obchodníkmi ako voľnými.</div>` : '';
     $id('srsOutput').innerHTML = `
       <div class="srs-summary"><b>Vybrané: ${names[chosen.mode]}</b> · horizont ${settings.horizonHours} h ·
         <b>${fmt(chosen.coins)} mincí</b> (simulácia okamžitého razenia) ·
