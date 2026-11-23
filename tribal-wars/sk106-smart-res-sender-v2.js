@@ -379,7 +379,7 @@
     </div>
     <div id="srsStatus" class="srs-note">Načítavam údaje…</div>
     <div id="srsOutput"></div>
-    <p class="srs-note">Prichádzajúce transporty a voľné miesto skladov sa započítavajú pri plánovaní.</p>
+    <p class="srs-note">Do plánu vstupujú rozpoznané prichádzajúce transporty a kapacita skladov.</p>
   `;
   (document.querySelector('#contentContainer') || document.body).prepend(el);
   const $id = id => el.querySelector('#' + id);
@@ -440,6 +440,64 @@
     }
     return { data, warnings, seen:nodes.length };
   }
+
+  // WH Balancer approach: count already inbound resource shipments as reserved.
+  function parseIncoming(markup) {
+    const dom = new DOMParser().parseFromString(markup, 'text/html');
+    const rows = [...dom.querySelectorAll('#trades_table tr')];
+    const byId = {};
+    const mobile = !!document.querySelector('#mobileHeader');
+    let parsed = 0, withoutETA = 0;
+    for (const row of rows) {
+      const cells = [...row.children].filter(x => x.tagName === 'TD');
+      if (cells.length < 6) continue;
+      // Desktop and mobile overview place destination links and resource icons in different cells.
+      const targetCell = cells[mobile ? 3 : 4];
+      const targetLink = [...(targetCell?.querySelectorAll('a[href]') || [])]
+        .map(x => x.getAttribute('href') || '').find(h => /[?&]id=\\d+/.test(h));
+      const id = targetLink?.match(/[?&]id=(\\d+)/)?.[1];
+      if (!id) continue;
+      const resourceCell = cells[mobile ? 5 : 8];
+      if (!resourceCell) continue;
+      const cargo = [0, 0, 0];
+      for (const k of RES) {
+        const found = resourceCell.querySelectorAll('.icon.' + k + ',.icon.m' + k + ',.header.' + k + ',.mheader.m' + k);
+        for (const icon of found) {
+          const wrap = icon.parentElement || icon;
+          const value = toInt(wrap.textContent);
+          if (value) cargo[RES.indexOf(k)] += value;
+        }
+      }
+      if (!cargo.some(Boolean)) continue;
+      const timer = row.querySelector('.timer,[data-endtime]');
+      let etaMinutes = null;
+      const stampText = timer?.getAttribute('data-endtime');
+      const timestamp = Number(stampText);
+      if (timestamp > 1e9) {
+        const epoch = timestamp > 1e12 ? timestamp / 1000 : timestamp;
+        etaMinutes = Math.max(0, (epoch - Date.now() / 1000) / 60);
+      } else if (timer) {
+        const match = timer.textContent.match(/(\\d+):(\\d{2}):(\\d{2})/);
+        if (match) etaMinutes = +match[1]*60 + +match[2] + +match[3]/60;
+      }
+      if (!byId[id]) byId[id] = { transfers:[], unknown:[0,0,0] };
+      if (etaMinutes == null) {
+        for (let j = 0; j < 3; j++) byId[id].unknown[j] += cargo[j];
+        withoutETA++;
+      } else byId[id].transfers.push({ cargo, etaMinutes });
+      parsed++;
+    }
+    return { byId, parsed, withoutETA };
+  }
+  async function fetchIncoming() {
+    const gd = root.game_data || {};
+    const sitterQuery = Number(gd.player?.sitter) > 0 ? 't=' + encodeURIComponent(gd.player.id) + '&' : '';
+    const response = await fetch('game.php?' + sitterQuery +
+      'screen=overview_villages&mode=trader&type=inc&page=-1',
+      { credentials:'same-origin', cache:'no-store' });
+    if (!response.ok) throw new Error('Prehľad transportov: HTTP ' + response.status);
+    return parseIncoming(await response.text());
+  }
   async function fetchOverview() {
     const gd = root.game_data || {};
     const sitter = Number(gd.player?.sitter) > 0;
@@ -454,11 +512,19 @@
     try {
       const p = await fetchOverview();
       if (!p.data.length) throw new Error(`Nepodarilo sa načítať údaje dedín (${p.seen} riadkov).`);
-      villages = p.data;
+      let inbound = { byId:{}, parsed:0, withoutETA:0 };
+      try { inbound = await fetchIncoming(); }
+      catch (err) { console.warn('Prichádzajúce transporty sa nenačítali:', err.message); }
+      villages = p.data.map(v => ({
+        ...v,
+        incomingTransfers: inbound.byId[v.id]?.transfers || [],
+        incomingUnknown: inbound.byId[v.id]?.unknown || [0,0,0]
+      }));
       snapshotAt = Date.now();
       alreadySent.clear();
       $id('srsStatus').innerHTML = `<span class="srs-ok">✓ ${p.data.length}/${p.seen} dedín načítaných</span>` +
         (p.warnings.length ? ` · <span class="srs-bad">${p.warnings.length} problémových riadkov: ${html(p.warnings.slice(0,4).join('; '))}</span>` : '') +
+        ` · Na ceste: ${inbound.parsed} transportov${inbound.withoutETA ? ' ('+inbound.withoutETA+' bez času)' : ''}` +
         ` · ${new Date(snapshotAt).toLocaleTimeString('sk-SK')}`;
       run();
     } catch (err) { $id('srsStatus').textContent = 'Chyba: '+err.message; $id('srsOutput').textContent = ''; }
